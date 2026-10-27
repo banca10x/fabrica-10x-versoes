@@ -9,15 +9,15 @@ name: Componente de download (yt-dlp + Deno)
 # O script auxiliar e a chave pública do yt-dlp vêm do repositório privado (FONTE_TOKEN, somente leitura); a impressão digital
 # da chave está fixada neste arquivo e é conferida antes de qualquer uso.
 on:
-  # ligar depois do ok do dono: remover o "#" das duas linhas abaixo para voltar à rotina diária.
-  # schedule:
-  #   - cron: "17 5 * * *"
+  # rotina diária (ligada em 2026-10-27 com o ok do dono)
+  schedule:
+    - cron: "17 5 * * *"
   workflow_dispatch:
     inputs:
       fonte_ref:
         description: "Tag ou branch do repositório privado de onde vêm o script auxiliar e a chave (ex.: v0.8.0)"
         required: true
-        default: v0.8.0
+        default: main
         type: string
 
 permissions:
@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: banca10x/fabrica-videos
-          ref: ${{ inputs.fonte_ref || 'v0.8.0' }}
+          ref: ${{ inputs.fonte_ref || 'main' }}
           token: ${{ secrets.FONTE_TOKEN }}
           persist-credentials: false
           sparse-checkout: empacotamento/download
