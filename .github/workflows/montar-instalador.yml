@@ -1,0 +1,443 @@
+name: Montar o instalador
+
+# Monta o instalador do Windows e publica a Release AQUI (repositório público: minutos de Actions grátis).
+# O código-fonte continua privado (banca10x/fabrica-videos): é baixado em memória com o segredo FONTE_TOKEN
+# (token fine-grained, só esse repositório, Contents: somente leitura). Os passos de build são os do release.yml privado.
+# Só dispara à mão. Sem pull_request, sem push, sem tag.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag ou branch do repositório privado banca10x/fabrica-videos (ex.: v0.8.0)"
+        required: true
+        default: v0.8.0
+        type: string
+      publicar:
+        description: "Publicar a Release neste repositório (desmarcado: só monta e guarda como artefato)"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write   # criar a Release neste repositório (GITHUB_TOKEN)
+
+concurrency:
+  group: montar-instalador
+  cancel-in-progress: false
+
+env:
+  # FFmpeg 7.1.1 "essentials" (GPLv3) da gyan.dev, espelhado em GitHub Releases com URL estável.
+  # Para trocar de versão: baixe o zip novo, calcule o SHA-256 (Get-FileHash / sha256sum) e atualize os DOIS valores.
+  FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-essentials_build.zip
+  FFMPEG_SHA256: 04861d3339c5ebe38b56c19a15cf2c0cc97f5de4fa8910e4d47e5e6404e4a2d4
+  FFMPEG_PASTA: ffmpeg-7.1.1-essentials_build
+  # Cenas de motion (componente opcional do instalador). Tudo pinado: versão, URL e SHA-256.
+  # NODE_SHA256: linha "node-v<versão>-win-x64.zip" de https://nodejs.org/dist/v<versão>/SHASUMS256.txt.
+  # CHROME_HS_SHA256: o Chrome for Testing não publica soma; o passo imprime o SHA-256 na primeira execução, confira e cole aqui.
+  # Enquanto um SHA-256 estiver vazio o passo NÃO falha: confere o Node contra o SHASUMS256.txt oficial, avisa e imprime o valor para pinar.
+  NODE_VERSAO: "22.22.0"
+  NODE_SHA256: ""
+  HF_VERSAO: "0.8.179"
+  GSAP_VERSAO: "3.14.2"
+  CHROME_HS_VERSAO: "152.0.7977.30"
+  CHROME_HS_URL: https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.30/win64/chrome-headless-shell-win64.zip
+  CHROME_HS_SHA256: ""
+  PYINSTALLER: "6.22.3"
+  PYINSTALLER_HOOKS: "2026.9"
+  INNO_VERSAO: "6.4.3"
+  PYTHONUTF8: "1"
+
+jobs:
+  windows:
+    name: Instalador do Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Conferir o segredo FONTE_TOKEN (sem imprimir o valor)
+        shell: pwsh
+        env:
+          FONTE_TOKEN: ${{ secrets.FONTE_TOKEN }}
+        run: |
+          if (-not $env:FONTE_TOKEN) { throw "Falta o segredo FONTE_TOKEN (Settings > Secrets and variables > Actions): token fine-grained só em banca10x/fabrica-videos, Contents: somente leitura." }
+
+      - name: Baixar o código-fonte privado
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: banca10x/fabrica-videos
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.FONTE_TOKEN }}
+          persist-credentials: false
+
+      - name: Versão (se a origem é uma tag, ela precisa bater com fabrica/__init__.py)
+        id: versao
+        shell: pwsh
+        env:
+          REF_ORIGEM: ${{ inputs.ref }}
+        run: |
+          $m = Select-String -Path fabrica/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"'
+          $v = $m.Matches[0].Groups[1].Value
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Versão inválida em fabrica/__init__.py: $v" }
+          if ($env:REF_ORIGEM -match '^v\d+\.\d+\.\d+') {
+            if ($env:REF_ORIGEM.Substring(1) -ne $v) { throw "A tag $env:REF_ORIGEM não bate com __version__ = $v em fabrica/__init__.py" }
+          }
+          "versao=$v" >> $env:GITHUB_OUTPUT
+          "Versão: $v"
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Montar a interface
+        shell: pwsh
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+          if (-not (Test-Path ../fabrica/app/static/index.html)) { throw "O build da interface não gerou fabrica/app/static/index.html" }
+
+      - name: Instalar dependências Python e PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pyinstaller==$env:PYINSTALLER" "pyinstaller-hooks-contrib==$env:PYINSTALLER_HOOKS"
+          # A janela e o cofre dependem de pacotes só do Windows: se faltarem em requirements.txt, falhe aqui com mensagem clara.
+          python -c "import webview, keyring, clr_loader; print('webview', webview.__file__)"
+          if ($LASTEXITCODE -ne 0) { throw "Faltam pywebview, pythonnet ou keyring no requirements.txt (marcadores de plataforma sys_platform == 'win32')." }
+
+      # ---- Cenas de motion: pacote SEPARADO do instalador (onda 4). O id só muda quando muda Node, HyperFrames, GSAP, Chrome ou o lock;
+      # ---- cada id vira uma release "cenas-runtime-<id>" (pré-lançamento, fora do "latest") no repositório privado e no espelho público.
+      # ---- O app baixa o zip sob demanda (SHA-256 pinado em fabrica/app/componente_cenas_pin.json, embutido no instalador).
+      - name: Cenas · identificador e pacote já publicado
+        id: cenas
+        shell: pwsh
+        env:
+          REPO_VERSOES: banca10x/fabrica-10x-versoes
+        run: |
+          $lock = (Get-FileHash -Algorithm SHA256 empacotamento/cenas-runtime/package-lock.json).Hash.ToLower().Substring(0, 8)
+          $id = "hf$env:HF_VERSAO-gs$env:GSAP_VERSAO-n$env:NODE_VERSAO-c$env:CHROME_HS_VERSAO-$lock"
+          $base = "https://github.com/$env:REPO_VERSOES/releases/download/cenas-runtime-$id"
+          $existe = 'false'
+          try {
+            Invoke-WebRequest "$base/cenas-runtime-$id.pin.json" -OutFile cenas-pin-publicado.json -MaximumRetryCount 2 -RetryIntervalSec 3
+            $existe = 'true'
+          } catch {
+            "Pacote $id ainda não publicado: será montado agora."
+          }
+          "id=$id" >> $env:GITHUB_OUTPUT
+          "existe=$existe" >> $env:GITHUB_OUTPUT
+          "Pacote das cenas: $id (já publicado: $existe)"
+
+      - name: Cenas · usar o pacote já publicado (confere o SHA-256 e expande para o autoteste)
+        if: steps.cenas.outputs.existe == 'true'
+        shell: pwsh
+        env:
+          REPO_VERSOES: banca10x/fabrica-10x-versoes
+          CENAS_ID: ${{ steps.cenas.outputs.id }}
+        run: |
+          $pin = Get-Content cenas-pin-publicado.json -Raw | ConvertFrom-Json
+          $zip = Join-Path $env:RUNNER_TEMP 'cenas-runtime.zip'
+          Invoke-WebRequest $pin.url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($hash -ne $pin.sha256) { throw "SHA-256 do pacote publicado difere do pin. Esperado $($pin.sha256), obtido $hash" }
+          Expand-Archive $zip -DestinationPath cenas-pkg
+          Copy-Item cenas-pin-publicado.json cenas-pin.json
+
+      - name: Cenas · Node portátil (conferido por SHA-256)
+        if: steps.cenas.outputs.existe != 'true'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'node.zip'
+          $base = "https://nodejs.org/dist/v$env:NODE_VERSAO"
+          Invoke-WebRequest "$base/node-v$env:NODE_VERSAO-win-x64.zip" -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "node SHA-256: $hash"
+          if ($env:NODE_SHA256) {
+            if ($hash -ne $env:NODE_SHA256) { throw "SHA-256 do Node difere. Esperado $env:NODE_SHA256, obtido $hash" }
+          } else {
+            $soma = (Invoke-WebRequest "$base/SHASUMS256.txt" -MaximumRetryCount 3 -RetryIntervalSec 5).Content -split "`n" | Where-Object { $_ -match "node-v$([regex]::Escape($env:NODE_VERSAO))-win-x64\.zip" } | Select-Object -First 1
+            if (-not $soma -or $soma.Split(' ')[0].ToLower() -ne $hash) { throw "SHA-256 do Node não bate com o SHASUMS256.txt oficial" }
+            Write-Warning "NODE_SHA256 não está pinado no release.yml. Valor conferido agora: $hash"
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $origem = Join-Path $env:RUNNER_TEMP "node-v$env:NODE_VERSAO-win-x64"
+          New-Item -ItemType Directory -Force cenas-pkg/LICENCAS-CENAS | Out-Null
+          Copy-Item "$origem/node.exe" cenas-pkg/
+          Copy-Item "$origem/LICENSE" cenas-pkg/LICENCAS-CENAS/NODE-LICENSE.txt -Force
+          "NODE_HASH=$hash" >> $env:GITHUB_ENV
+          & cenas-pkg/node.exe --version
+
+      - name: Cenas · hyperframes e gsap (npm ci do lock versionado)
+        if: steps.cenas.outputs.existe != 'true'
+        shell: pwsh
+        run: |
+          $rt = 'cenas-pkg'
+          Copy-Item empacotamento/cenas-runtime/package.json, empacotamento/cenas-runtime/package-lock.json $rt
+          Push-Location $rt
+          npm ci --omit=dev --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm ci do cenas-runtime falhou" }
+          Pop-Location
+          $hf = (Get-Content "$rt/node_modules/hyperframes/package.json" | ConvertFrom-Json).version
+          $gs = (Get-Content "$rt/node_modules/gsap/package.json" | ConvertFrom-Json).version
+          if ($hf -ne $env:HF_VERSAO) { throw "hyperframes $hf, esperado $env:HF_VERSAO" }
+          if ($gs -ne $env:GSAP_VERSAO) { throw "gsap $gs, esperado $env:GSAP_VERSAO" }
+          $sharp = Test-Path "$rt/node_modules/@img/sharp-win32-x64"
+          if (-not $sharp) { throw "Falta @img/sharp-win32-x64 no runtime (dependência nativa do Windows)" }
+          $tam = (Get-ChildItem $rt -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
+          "runtime npm: {0:N0} MB" -f $tam
+
+      - name: Cenas · chrome-headless-shell pinado
+        if: steps.cenas.outputs.existe != 'true'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'chs.zip'
+          Invoke-WebRequest $env:CHROME_HS_URL -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "chrome-headless-shell zip SHA-256: $hash"
+          if ($env:CHROME_HS_SHA256) {
+            if ($hash -ne $env:CHROME_HS_SHA256) { throw "SHA-256 do chrome-headless-shell difere. Esperado $env:CHROME_HS_SHA256, obtido $hash" }
+          } else {
+            Write-Warning "CHROME_HS_SHA256 não está pinado no release.yml. Confira o valor acima e cole no env."
+          }
+          # a pasta leva a versão no nome: o app lê a versão do Chrome por ela
+          $destino = "cenas-pkg/chrome-headless-shell/$env:CHROME_HS_VERSAO"
+          New-Item -ItemType Directory -Force $destino | Out-Null
+          Expand-Archive $zip -DestinationPath $destino
+          $exe = Get-ChildItem $destino -Recurse -Filter chrome-headless-shell.exe | Select-Object -First 1
+          if (-not $exe) { throw "chrome-headless-shell.exe não encontrado no zip" }
+          Get-AuthenticodeSignature $exe.FullName | Format-List Status, SignerCertificate
+          # anexa as licenças que vêm no zip oficial ao aviso do Chrome (dentro do pacote das cenas)
+          foreach ($l in (Get-ChildItem $exe.DirectoryName -File | Where-Object { $_.Name -match '^(LICENSE|credits)' })) {
+            Add-Content -Encoding utf8 cenas-pkg/LICENCAS-CENAS/CHROME-HEADLESS-SHELL.txt "`n==== $($l.Name) ====`n"
+            Get-Content $l.FullName -Raw | Add-Content -Encoding utf8 cenas-pkg/LICENCAS-CENAS/CHROME-HEADLESS-SHELL.txt
+          }
+          "CHROME_HASH=$hash" >> $env:GITHUB_ENV
+
+      - name: Cenas · RUNTIME.json, zip e pin
+        if: steps.cenas.outputs.existe != 'true'
+        shell: pwsh
+        env:
+          CENAS_ID: ${{ steps.cenas.outputs.id }}
+          REPO_VERSOES: banca10x/fabrica-10x-versoes
+        run: |
+          $rt = 'cenas-pkg'
+          Copy-Item LICENCAS/GSAP-LICENCA.txt, LICENCAS/HYPERFRAMES-APACHE-2.0.txt, LICENCAS/CENAS-ORIGEM.txt $rt/LICENCAS-CENAS -Force
+          [ordered]@{
+            node = $env:NODE_VERSAO; hyperframes = $env:HF_VERSAO; gsap = $env:GSAP_VERSAO; chrome = $env:CHROME_HS_VERSAO
+            node_zip_sha256 = $env:NODE_HASH; chrome_zip_sha256 = $env:CHROME_HASH
+            node_exe_sha256 = (Get-FileHash -Algorithm SHA256 "$rt/node.exe").Hash.ToLower()
+          } | ConvertTo-Json | Set-Content -Encoding utf8 "$rt/RUNTIME.json"
+          $extraido = (Get-ChildItem $rt -Recurse -File | Measure-Object Length -Sum).Sum
+          $nome = "cenas-runtime-$env:CENAS_ID.zip"
+          $zip = Join-Path (Get-Location) $nome
+          Compress-Archive -Path "$rt/*" -DestinationPath $zip -CompressionLevel Optimal
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          $bytes = (Get-Item $zip).Length
+          "Pacote das cenas: {0:N0} MB comprimido, {1:N0} MB no disco" -f ($bytes / 1MB), ($extraido / 1MB)
+          # Orçamento do download sob demanda: acima disso algo entrou que não devia (ex.: node_modules duplicado).
+          if ($bytes -gt 350MB) { throw "Pacote das cenas com $([math]::Round($bytes / 1MB)) MB: passou do orçamento de 350 MB" }
+          [ordered]@{
+            id = $env:CENAS_ID; arquivo = $nome; sha256 = $sha; bytes = $bytes; bytes_extraido = $extraido
+            url = "https://github.com/$env:REPO_VERSOES/releases/download/cenas-runtime-$env:CENAS_ID/$nome"
+            versoes = [ordered]@{ node = $env:NODE_VERSAO; hyperframes = $env:HF_VERSAO; gsap = $env:GSAP_VERSAO; chrome = $env:CHROME_HS_VERSAO }
+            node_zip_sha256 = $env:NODE_HASH; chrome_zip_sha256 = $env:CHROME_HASH
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 "cenas-runtime-$env:CENAS_ID.pin.json"
+          Copy-Item "cenas-runtime-$env:CENAS_ID.pin.json" cenas-pin.json
+          Move-Item $zip (Join-Path $env:RUNNER_TEMP $nome) -Force
+
+      - name: Cenas · publicar o pacote (release própria, fora do "latest")
+        if: inputs.publicar && steps.cenas.outputs.existe != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_VERSOES: banca10x/fabrica-10x-versoes
+          CENAS_ID: ${{ steps.cenas.outputs.id }}
+        run: |
+          $tag = "cenas-runtime-$env:CENAS_ID"
+          $zip = Join-Path $env:RUNNER_TEMP "$tag.zip"
+          $pin = "$tag.pin.json"
+          $notas = "Pacote das cenas de motion (Node, HyperFrames, GSAP e Chrome sem janela). Baixado pelo app sob demanda; não é uma versão do programa."
+          # O pacote vai ANTES do instalador: o pin embutido no instalador aponta para esta release.
+          gh release view $tag --repo $env:REPO_VERSOES *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag $zip $pin --title $tag --notes $notas --prerelease --latest=false --repo $env:REPO_VERSOES --target ${{ github.event.repository.default_branch }}
+            if ($LASTEXITCODE -ne 0) { throw "gh release create do pacote das cenas falhou ($LASTEXITCODE)" }
+          }
+          "Pacote das cenas publicado: https://github.com/$env:REPO_VERSOES/releases/tag/$tag"
+
+      - name: Cenas · gravar o pin no app (vai dentro do instalador)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path cenas-pin.json)) { Set-Content -Encoding utf8 cenas-pin.json '{}' }
+          Copy-Item cenas-pin.json fabrica/app/componente_cenas_pin.json -Force
+          Get-Content fabrica/app/componente_cenas_pin.json -TotalCount 12
+          $env:PYTHONPATH = (Get-Location).Path
+          python -c "from fabrica.app import componente_cenas as c; p = c.carregar_pin(); print('pin das cenas:', p.get('id') or 'VAZIO')"
+
+      - name: PyInstaller
+        shell: pwsh
+        run: python -m PyInstaller empacotamento/fabrica10x.spec --noconfirm --clean
+
+      - name: Baixar o FFmpeg e conferir o SHA-256
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($hash -ne $env:FFMPEG_SHA256) { throw "SHA-256 do FFmpeg difere. Esperado $env:FFMPEG_SHA256, obtido $hash" }
+          $tmp = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          Expand-Archive -Path $zip -DestinationPath $tmp
+          $bin = Join-Path $tmp "$env:FFMPEG_PASTA/bin"
+          $destino = 'dist/Fabrica10x/ffmpeg'
+          New-Item -ItemType Directory -Force $destino | Out-Null
+          Copy-Item "$bin/ffmpeg.exe", "$bin/ffprobe.exe" $destino
+          Copy-Item (Join-Path $tmp "$env:FFMPEG_PASTA/LICENSE") 'LICENCAS/FFMPEG-GPLv3.txt' -Force
+          Copy-Item LICENCAS dist/Fabrica10x/LICENCAS -Recurse
+          & "$destino/ffmpeg.exe" -version | Select-Object -First 1
+
+      - name: Autoteste do executável (console)
+        shell: pwsh
+        timeout-minutes: 15
+        env:
+          FABRICA_HYPERFRAMES_DIR: ${{ github.workspace }}/cenas-pkg      # o pacote das cenas montado acima (o app o baixa em produção)
+        run: |
+          & dist/Fabrica10x/fabrica10x-cli.exe --autoteste
+          if ($LASTEXITCODE -ne 0) { throw "Autoteste falhou (código $LASTEXITCODE)" }
+          & dist/Fabrica10x/fabrica10x-cli.exe --autoteste --com-cenas
+          if ($LASTEXITCODE -ne 0) { throw "Autoteste com cenas falhou (código $LASTEXITCODE): o renderizador das cenas está incompleto" }
+          & dist/Fabrica10x/fabrica10x-cli.exe receita dark --help | Select-Object -First 3
+          if ($LASTEXITCODE -ne 0) { throw "receita dark --help falhou (código $LASTEXITCODE)" }
+
+      - name: Autoteste do executável de janela (stdout redirecionado)
+        shell: pwsh
+        timeout-minutes: 15
+        env:
+          FABRICA_HYPERFRAMES_DIR: ${{ github.workspace }}/cenas-pkg
+        run: |
+          # Valida a premissa do app: Fabrica10x.exe (sem console) funciona com stdout/stderr em arquivo/pipe.
+          $out = Join-Path $env:RUNNER_TEMP 'janela-out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'janela-err.txt'
+          $p = Start-Process dist/Fabrica10x/Fabrica10x.exe -ArgumentList '--autoteste','--com-cenas' -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          "código de saída: $($p.ExitCode)"
+          Get-Content $out -ErrorAction SilentlyContinue | Select-Object -First 20
+          Get-Content $err -ErrorAction SilentlyContinue | Select-Object -First 20
+          if ($p.ExitCode -ne 0) { throw "Autoteste (janela) falhou: código $($p.ExitCode)" }
+          if ((Get-Item $out).Length -eq 0) { Write-Warning "O exe de janela não escreveu no stdout redirecionado: o app deve usar fabrica10x-cli.exe nos subprocessos." }
+
+      - name: Instalar o Inno Setup se faltar
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $padrao = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $padrao)) {
+              choco install innosetup --version=$env:INNO_VERSAO --no-progress -y
+            }
+          }
+          $caminho = if ($iscc) { $iscc.Source } else { "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $caminho)) { throw "ISCC.exe não encontrado" }
+          "ISCC=$caminho" >> $env:GITHUB_ENV
+
+      - name: Compilar o instalador
+        id: instalador
+        shell: pwsh
+        run: |
+          & $env:ISCC "/DVersao=${{ steps.versao.outputs.versao }}" empacotamento/instalador.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC falhou ($LASTEXITCODE)" }
+          $arq = "dist/instalador/Fabrica10x-Setup-${{ steps.versao.outputs.versao }}.exe"
+          $sha = (Get-FileHash -Algorithm SHA256 $arq).Hash.ToLower()
+          $mb = [math]::Round((Get-Item $arq).Length / 1MB)
+          "Instalador: $mb MB"
+          # Orçamento: o instalador não leva mais o runtime das cenas (pacote à parte, baixado sob demanda): base ~190 MB.
+          # Acima de 300 MB algo entrou que não devia (ex.: node_modules ou cenas-runtime dentro do dist).
+          if ($mb -gt 300) { throw "Instalador com $mb MB: passou do orçamento de 300 MB" }
+          if (Test-Path dist/Fabrica10x/cenas-runtime) { throw "dist/Fabrica10x/cenas-runtime não deve ir no instalador (as cenas são um pacote à parte)" }
+          $pinc = Get-Content fabrica/app/componente_cenas_pin.json -Raw | ConvertFrom-Json
+          "arquivo=$arq" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          @"
+          ## Fábrica de Vídeos 10x ${{ steps.versao.outputs.versao }}
+
+          Baixe **Fabrica10x-Setup-${{ steps.versao.outputs.versao }}.exe** abaixo, abra e siga o assistente.
+          O Windows vai avisar que o programa não é assinado: clique em **Mais informações** e depois em **Executar assim mesmo**.
+
+          SHA-256 do instalador: ``$sha``
+          Os arquivos ``.sha256`` (e ``.sig``, quando a assinatura está ligada) acompanham o instalador: é com eles que o programa confere a atualização sozinho.
+
+          FFmpeg 7.1.1 (gyan.dev, GPLv3) incluído, SHA-256 do zip original: ``$env:FFMPEG_SHA256``
+
+          Cenas de motion: pacote separado (Node $env:NODE_VERSAO, HyperFrames $env:HF_VERSAO, GSAP $env:GSAP_VERSAO e Chrome sem janela $env:CHROME_HS_VERSAO),
+          baixado pelo próprio programa quando você pedir, e só de novo quando uma dessas versões mudar. Pacote: ``${{ steps.cenas.outputs.id }}``
+          SHA-256 do pacote das cenas: ``$($pinc.sha256)``
+          "@ | Set-Content -Encoding utf8 release-notas.md
+          # Notas para o usuário (docs/NOTAS-vX.Y.Z.md no código-fonte), antes do bloco técnico.
+          $notasUsuario = "docs/NOTAS-v${{ steps.versao.outputs.versao }}.md"
+          if (Test-Path $notasUsuario) {
+            $corpo = (Get-Content $notasUsuario -Raw -Encoding utf8).TrimEnd() + "`n`n---`n`n" + (Get-Content release-notas.md -Raw -Encoding utf8)
+            Set-Content -Encoding utf8 release-notas.md $corpo
+          } else {
+            Write-Warning "Sem $notasUsuario: a Release sai só com o bloco técnico."
+          }
+
+      - name: SHA-256 e assinatura do instalador (assets que o app confere ao atualizar)
+        id: integridade
+        shell: pwsh
+        env:
+          # Segredo opcional: sem ele a Release sai só com o .sha256 (o app só exige .sig se tiver a chave pública embutida).
+          FABRICA_ASSINATURA_ED25519: ${{ secrets.FABRICA_ASSINATURA_ED25519 }}
+        run: |
+          $arq = "${{ steps.instalador.outputs.arquivo }}"
+          $nome = Split-Path $arq -Leaf
+          $sha = (Get-FileHash -Algorithm SHA256 $arq).Hash.ToLower()
+          # mesmo formato do sha256sum ("<hash>  <arquivo>"), UTF-8 sem BOM
+          [System.IO.File]::WriteAllText("$arq.sha256", "$sha  $nome`n", (New-Object System.Text.UTF8Encoding $false))
+          $lista = @($arq, "$arq.sha256")
+          if ($env:FABRICA_ASSINATURA_ED25519) {
+            python empacotamento/assinar.py assinar --arquivo $arq --saida "$arq.sig"
+            if ($LASTEXITCODE -ne 0) { throw "A assinatura do instalador falhou (código $LASTEXITCODE)" }
+            $lista += "$arq.sig"
+          } else {
+            "Segredo FABRICA_ASSINATURA_ED25519 ausente: a Release sai sem .sig."
+          }
+          "arquivos<<FIM" >> $env:GITHUB_OUTPUT
+          $lista >> $env:GITHUB_OUTPUT
+          "FIM" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Fabrica10x-Setup-${{ steps.versao.outputs.versao }}
+          path: ${{ steps.integridade.outputs.arquivos }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publicar a Release neste repositório
+        if: inputs.publicar
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_VERSOES: banca10x/fabrica-10x-versoes
+          TAG: v${{ steps.versao.outputs.versao }}
+          ALVO: ${{ github.event.repository.default_branch }}
+          ARQUIVOS: ${{ steps.integridade.outputs.arquivos }}
+        run: |
+          # O app dos usuários atualiza por este repositório (releases/latest), sem token.
+          $arquivos = @($env:ARQUIVOS -split "`r?`n" | Where-Object { $_ })
+          if ($arquivos.Count -eq 0) { throw "Nenhum arquivo de lançamento para publicar" }
+          gh release view $env:TAG --repo $env:REPO_VERSOES *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG @arquivos --clobber --repo $env:REPO_VERSOES
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload falhou ($LASTEXITCODE)" }
+            gh release edit $env:TAG --notes-file release-notas.md --latest --repo $env:REPO_VERSOES
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit falhou ($LASTEXITCODE)" }
+          } else {
+            gh release create $env:TAG @arquivos --title $env:TAG --notes-file release-notas.md --latest --target $env:ALVO --repo $env:REPO_VERSOES
+            if ($LASTEXITCODE -ne 0) { throw "gh release create falhou ($LASTEXITCODE)" }
+          }
+          "Publicado em https://github.com/$env:REPO_VERSOES/releases/tag/$env:TAG"

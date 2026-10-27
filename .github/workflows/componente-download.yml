@@ -1,0 +1,155 @@
+name: Componente de download (yt-dlp + Deno)
+
+# Canal de atualização PRÓPRIO do componente de download do app (independente das versões do programa).
+# Pega o yt-dlp ESTÁVEL mais novo que já tem pelo menos 24 h, confere SHA2-256SUMS e a ASSINATURA GPG (chave fixada abaixo),
+# junta o Deno de versão fixada (conferido pelo .sha256sum oficial) e publica AQUI (repositório público, GITHUB_TOKEN):
+#   * release download-runtime-<id>      zip + componente_download.json (uma por id)
+#   * release download-runtime-latest    só o componente_download.json (ponteiro que o app lê)
+# Ambas como pré-lançamento e fora do "latest", para não atrapalhar a atualização do programa.
+# O script auxiliar e a chave pública do yt-dlp vêm do repositório privado (FONTE_TOKEN, somente leitura); a impressão digital
+# da chave está fixada neste arquivo e é conferida antes de qualquer uso.
+on:
+  # ligar depois do ok do dono: remover o "#" das duas linhas abaixo para voltar à rotina diária.
+  # schedule:
+  #   - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      fonte_ref:
+        description: "Tag ou branch do repositório privado de onde vêm o script auxiliar e a chave (ex.: v0.8.0)"
+        required: true
+        default: v0.8.0
+        type: string
+
+permissions:
+  contents: write   # criar/atualizar as releases deste repositório
+
+concurrency:
+  group: componente-download
+  cancel-in-progress: false
+
+env:
+  # Impressão digital (primária) da chave de assinatura do yt-dlp, a mesma de empacotamento/download/yt-dlp-public.key
+  # (origem: https://github.com/yt-dlp/yt-dlp/blob/master/public.key). Se a chave do arquivo não tiver esta impressão, o workflow falha.
+  YTDLP_GPG_FINGERPRINT: AC0CBBE6848D6A873464AF4E57CF65933B5A7581
+  # Versão do Deno fixada: mudar aqui é uma decisão consciente (muda o id do componente).
+  DENO_VERSAO: "2.9.8"
+  IDADE_MINIMA_HORAS: "24"
+  REPO_VERSOES: banca10x/fabrica-10x-versoes
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Baixar só o necessário do código-fonte privado (script auxiliar e chave pública)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: banca10x/fabrica-videos
+          ref: ${{ inputs.fonte_ref || 'v0.8.0' }}
+          token: ${{ secrets.FONTE_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: empacotamento/download
+          path: fonte
+
+      - name: Escolher o yt-dlp estável (com pelo menos 24 h de idade)
+        id: escolha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/yt-dlp/yt-dlp/releases?per_page=20" > releases.json
+          if ! TAG=$(python3 fonte/empacotamento/download/montar_componente.py escolher releases.json --horas "$IDADE_MINIMA_HORAS"); then
+            echo "::notice::Nenhuma release estável do yt-dlp com $IDADE_MINIMA_HORAS h de idade ainda; tenta de novo no próximo ciclo."
+            echo "pronto=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "pronto=true" >> "$GITHUB_OUTPUT"
+          echo "yt-dlp escolhido: $TAG"
+
+      - name: Baixar yt-dlp.exe e as somas
+        if: steps.escolha.outputs.pronto == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.escolha.outputs.tag }}
+        run: |
+          mkdir -p work && cd work
+          gh release download "$TAG" --repo yt-dlp/yt-dlp --pattern "yt-dlp.exe" --pattern "SHA2-256SUMS" --pattern "SHA2-256SUMS.sig"
+          ls -l
+
+      - name: Conferir a assinatura GPG do SHA2-256SUMS e o SHA-256 do yt-dlp.exe
+        if: steps.escolha.outputs.pronto == 'true'
+        run: |
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --quiet --import fonte/empacotamento/download/yt-dlp-public.key
+          PRIMARIA=$(gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ "$PRIMARIA" != "$YTDLP_GPG_FINGERPRINT" ]; then
+            echo "::error::A chave do yt-dlp no repositório tem outra impressão digital ($PRIMARIA) que a fixada."
+            exit 1
+          fi
+          gpg --batch --status-fd 1 --verify work/SHA2-256SUMS.sig work/SHA2-256SUMS > gpg-status.txt 2> gpg-erro.txt || { cat gpg-erro.txt; echo "::error::Assinatura GPG do SHA2-256SUMS inválida."; exit 1; }
+          # VALIDSIG <subchave> ... <chave primária>: o último campo é a impressão da chave primária que assinou.
+          ASSINOU=$(awk '/^\[GNUPG:\] VALIDSIG/ {print $NF; exit}' gpg-status.txt)
+          if [ "$ASSINOU" != "$YTDLP_GPG_FINGERPRINT" ]; then
+            echo "::error::O SHA2-256SUMS foi assinado por outra chave ($ASSINOU)."
+            exit 1
+          fi
+          python3 fonte/empacotamento/download/montar_componente.py conferir-sums work/SHA2-256SUMS work/yt-dlp.exe yt-dlp.exe
+          echo "Assinatura GPG e SHA-256 do yt-dlp.exe conferidos."
+
+      - name: Baixar e conferir o Deno (versão fixada)
+        if: steps.escolha.outputs.pronto == 'true'
+        run: |
+          cd work
+          BASE="https://github.com/denoland/deno/releases/download/v${DENO_VERSAO}"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 -o deno.zip "$BASE/deno-x86_64-pc-windows-msvc.zip"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 -o deno.zip.sha256sum "$BASE/deno-x86_64-pc-windows-msvc.zip.sha256sum"
+          python3 ../fonte/empacotamento/download/montar_componente.py conferir-hash deno.zip.sha256sum deno.zip
+          unzip -o -q deno.zip deno.exe
+          test -s deno.exe
+
+      - name: Montar o zip e o manifesto
+        id: montar
+        if: steps.escolha.outputs.pronto == 'true'
+        env:
+          TAG: ${{ steps.escolha.outputs.tag }}
+        run: |
+          ID=$(python3 fonte/empacotamento/download/montar_componente.py id "$TAG" "$DENO_VERSAO")
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          cd work
+          cat > LEIA-ME.txt <<TXT
+          Componente de download da Fabrica de Videos 10x
+          yt-dlp $TAG (Unlicense, https://github.com/yt-dlp/yt-dlp) com SHA2-256SUMS e assinatura GPG conferidos.
+          Deno $DENO_VERSAO (MIT, https://github.com/denoland/deno) conferido pelo .sha256sum oficial.
+          TXT
+          ZIP="componente-download-$ID.zip"
+          zip -X -9 -q "$ZIP" yt-dlp.exe deno.exe LEIA-ME.txt
+          URL="https://github.com/$REPO_VERSOES/releases/download/download-runtime-$ID/$ZIP"
+          python3 ../fonte/empacotamento/download/montar_componente.py manifesto --id "$ID" --zip "$ZIP" --ytdlp "$TAG" --deno "$DENO_VERSAO" --url "$URL" --saida componente_download.json
+          cat componente_download.json
+          echo "zip=work/$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar neste repositório
+        if: steps.escolha.outputs.pronto == 'true'
+        env:
+          # O GITHUB_TOKEN do próprio repositório público basta (permissions: contents: write). Nunca é impresso.
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ steps.montar.outputs.id }}
+          ZIP: ${{ steps.montar.outputs.zip }}
+        run: |
+          TAG="download-runtime-$ID"
+          NOTAS="Componente de download do app (yt-dlp e Deno). Baixado pelo app sozinho; não é uma versão do programa."
+          MANIFESTO=work/componente_download.json
+          if ! gh release view "$TAG" --repo "$REPO_VERSOES" > /dev/null 2>&1; then
+            gh release create "$TAG" "$ZIP" "$MANIFESTO" --repo "$REPO_VERSOES" --title "$TAG" --notes "$NOTAS" --prerelease --latest=false
+          else
+            echo "A release $TAG já existe; só confiro o ponteiro."
+          fi
+          PONTEIRO="download-runtime-latest"
+          if gh release view "$PONTEIRO" --repo "$REPO_VERSOES" > /dev/null 2>&1; then
+            gh release upload "$PONTEIRO" "$MANIFESTO" --clobber --repo "$REPO_VERSOES"
+            gh release edit "$PONTEIRO" --notes "Ponteiro do componente de download: aponta para $ID." --prerelease --latest=false --repo "$REPO_VERSOES"
+          else
+            gh release create "$PONTEIRO" "$MANIFESTO" --repo "$REPO_VERSOES" --title "$PONTEIRO" --notes "Ponteiro do componente de download: aponta para $ID." --prerelease --latest=false
+          fi
+          echo "Publicado: https://github.com/$REPO_VERSOES/releases/tag/$TAG"
