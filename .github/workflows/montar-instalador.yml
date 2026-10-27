@@ -383,7 +383,7 @@ jobs:
             $corpo = (Get-Content $notasUsuario -Raw -Encoding utf8).TrimEnd() + "`n`n---`n`n" + (Get-Content release-notas.md -Raw -Encoding utf8)
             Set-Content -Encoding utf8 release-notas.md $corpo
           } else {
-            Write-Warning "Sem $notasUsuario: a Release sai só com o bloco técnico."
+            Write-Warning "Sem ${notasUsuario}: a Release sai só com o bloco técnico."
           }
 
       - name: SHA-256 e assinatura do instalador (assets que o app confere ao atualizar)
