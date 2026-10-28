@@ -8,7 +8,7 @@ name: Componente de download (yt-dlp + Deno)
 # Ambas como pré-lançamento e fora do "latest", para não atrapalhar a atualização do programa.
 #
 # ASSINATURA (obrigatória): o app só aceita o manifesto com o arquivo componente_download.json.sig (Ed25519, chave pública embutida no
-# programa). O job usa o Environment "assinatura" (Settings > Environments), que o dono precisa criar: "Deployment branches and tags"
+# programa). O job usa o Environment "FABRICA_ASSINATURA_ED25519" (Settings > Environments), que o dono precisa criar: "Deployment branches and tags"
 # restrito à main, com o segredo FABRICA_ASSINATURA_ED25519 (64 caracteres hexadecimais) guardado DENTRO do Environment. O segredo só é
 # lido pelo passo "Assinar o manifesto". Sem ele o job falha; antes de publicar, "Autoverificação" confere o .sig contra a chave pública.
 # O .sig sobe para as DUAS releases (download-runtime-<id> e download-runtime-latest), sobre os bytes exatos do manifesto publicado.
@@ -46,7 +46,7 @@ jobs:
   publicar:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: assinatura        # guarda o segredo FABRICA_ASSINATURA_ED25519 (restrito à main); ver o comentário no topo
+    environment: FABRICA_ASSINATURA_ED25519        # guarda o segredo FABRICA_ASSINATURA_ED25519 (restrito à main); ver o comentário no topo
     steps:
       - name: Conferir os segredos FONTE_TOKEN e FABRICA_ASSINATURA_ED25519 (sem imprimir os valores)
         shell: bash
@@ -59,7 +59,7 @@ jobs:
             exit 1
           fi
           if [ -z "$FABRICA_ASSINATURA_ED25519" ]; then
-            echo "::error::Falta o segredo FABRICA_ASSINATURA_ED25519. Crie o Environment 'assinatura' (restrito à main) e guarde o segredo dentro dele; sem assinatura o app recusa o componente."
+            echo "::error::Falta o segredo FABRICA_ASSINATURA_ED25519. Crie o Environment 'FABRICA_ASSINATURA_ED25519' (restrito à main) e guarde o segredo dentro dele; sem assinatura o app recusa o componente."
             exit 1
           fi
           if ! [[ "$FABRICA_ASSINATURA_ED25519" =~ ^[0-9a-fA-F]{64}$ ]]; then

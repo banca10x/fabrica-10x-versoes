@@ -56,7 +56,7 @@ def _chave_privada(chave_publica_hex: str = CHAVE_PUBLICA_HEX):
 
     bruto = os.environ.get(VARIAVEL, "")
     if not bruto:
-        raise SystemExit(_falha(f"O segredo {VARIAVEL} está ausente. Crie o Environment 'assinatura' e coloque o segredo dentro dele (docs/LANCAMENTO.md)."))
+        raise SystemExit(_falha(f"O segredo {VARIAVEL} está ausente. Crie o Environment 'FABRICA_ASSINATURA_ED25519' e coloque o segredo dentro dele (docs/LANCAMENTO.md)."))
     if not re.fullmatch(r"[0-9a-fA-F]{64}", bruto):   # sem strip: espaço ou quebra de linha sobrando reprova, como no passo de conferência do workflow
         raise SystemExit(_falha(f"O segredo {VARIAVEL} não tem 64 caracteres hexadecimais (semente Ed25519). Não vou assinar."))
     priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(bruto))
