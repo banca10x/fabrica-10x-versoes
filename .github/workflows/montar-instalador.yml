@@ -4,6 +4,13 @@ name: Montar o instalador
 # O código-fonte continua privado (banca10x/fabrica-videos): é baixado em memória com o segredo FONTE_TOKEN
 # (token fine-grained, só esse repositório, Contents: somente leitura). Os passos de build são os do release.yml privado.
 # Só dispara à mão. Sem pull_request, sem push, sem tag.
+#
+# ASSINATURA (obrigatória): o aplicativo recusa atualização sem o arquivo .sig do instalador. O job usa o Environment "FABRICA_ASSINATURA_ED25519"
+# (Settings > Environments), que o dono precisa criar: "Deployment branches and tags" restrito à branch main (e às tags v*),
+# com o segredo FABRICA_ASSINATURA_ED25519 (semente Ed25519, 64 caracteres hexadecimais) guardado DENTRO do Environment, não como
+# segredo do repositório. O segredo só é lido por UM passo ("Assinar o instalador"); os passos de build, que rodam código do
+# repositório privado, nunca o recebem. Sem o segredo o job falha logo no começo. Antes de publicar, "Autoverificação" confere o
+# .sig contra a chave pública embutida no aplicativo (a mesma de .github/scripts/assinar_ci.py) e o job falha se não bater.
 on:
   workflow_dispatch:
     inputs:
@@ -52,13 +59,26 @@ jobs:
     name: Instalador do Windows
     runs-on: windows-latest
     timeout-minutes: 60
+    environment: FABRICA_ASSINATURA_ED25519        # guarda o segredo FABRICA_ASSINATURA_ED25519 (restrito a main/tags); ver o comentário no topo
     steps:
-      - name: Conferir o segredo FONTE_TOKEN (sem imprimir o valor)
-        shell: pwsh
+      - name: Conferir os segredos FONTE_TOKEN e FABRICA_ASSINATURA_ED25519 (sem imprimir os valores)
+        shell: bash
         env:
           FONTE_TOKEN: ${{ secrets.FONTE_TOKEN }}
+          FABRICA_ASSINATURA_ED25519: ${{ secrets.FABRICA_ASSINATURA_ED25519 }}
         run: |
-          if (-not $env:FONTE_TOKEN) { throw "Falta o segredo FONTE_TOKEN (Settings > Secrets and variables > Actions): token fine-grained só em banca10x/fabrica-videos, Contents: somente leitura." }
+          if [ -z "$FONTE_TOKEN" ]; then
+            echo "::error::Falta o segredo FONTE_TOKEN (Settings > Secrets and variables > Actions): token fine-grained só em banca10x/fabrica-videos, Contents: somente leitura."
+            exit 1
+          fi
+          if [ -z "$FABRICA_ASSINATURA_ED25519" ]; then
+            echo "::error::Falta o segredo FABRICA_ASSINATURA_ED25519. Crie o Environment 'FABRICA_ASSINATURA_ED25519' (restrito à main) e guarde o segredo dentro dele; sem assinatura o app recusa a atualização."
+            exit 1
+          fi
+          if ! [[ "$FABRICA_ASSINATURA_ED25519" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::O segredo FABRICA_ASSINATURA_ED25519 precisa ter exatamente 64 caracteres hexadecimais (semente Ed25519)."
+            exit 1
+          fi
 
       - name: Baixar o código-fonte privado
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -67,6 +87,15 @@ jobs:
           ref: ${{ inputs.ref }}
           token: ${{ secrets.FONTE_TOKEN }}
           persist-credentials: false
+
+      - name: Baixar o script de assinatura deste repositório (não vem do código privado)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          path: ci
 
       - name: Versão (se a origem é uma tag, ela precisa bater com fabrica/__init__.py)
         id: versao
@@ -369,7 +398,7 @@ jobs:
           O Windows vai avisar que o programa não é assinado: clique em **Mais informações** e depois em **Executar assim mesmo**.
 
           SHA-256 do instalador: ``$sha``
-          Os arquivos ``.sha256`` (e ``.sig``, quando a assinatura está ligada) acompanham o instalador: é com eles que o programa confere a atualização sozinho.
+          Os arquivos ``.sha256`` (e ``.sig``, a assinatura Ed25519) acompanham o instalador: é com eles que o programa confere a atualização sozinho.
 
           FFmpeg 7.1.1 (gyan.dev, GPLv3) incluído, SHA-256 do zip original: ``$env:FFMPEG_SHA256``
 
@@ -386,34 +415,57 @@ jobs:
             Write-Warning "Sem ${notasUsuario}: a Release sai só com o bloco técnico."
           }
 
-      - name: SHA-256 e assinatura do instalador (assets que o app confere ao atualizar)
+      - name: SHA-256 do instalador (asset que o app confere ao atualizar)
         id: integridade
         shell: pwsh
-        env:
-          # Segredo opcional: sem ele a Release sai só com o .sha256 (o app só exige .sig se tiver a chave pública embutida).
-          FABRICA_ASSINATURA_ED25519: ${{ secrets.FABRICA_ASSINATURA_ED25519 }}
         run: |
           $arq = "${{ steps.instalador.outputs.arquivo }}"
           $nome = Split-Path $arq -Leaf
           $sha = (Get-FileHash -Algorithm SHA256 $arq).Hash.ToLower()
           # mesmo formato do sha256sum ("<hash>  <arquivo>"), UTF-8 sem BOM
           [System.IO.File]::WriteAllText("$arq.sha256", "$sha  $nome`n", (New-Object System.Text.UTF8Encoding $false))
-          $lista = @($arq, "$arq.sha256")
-          if ($env:FABRICA_ASSINATURA_ED25519) {
-            python empacotamento/assinar.py assinar --arquivo $arq --saida "$arq.sig"
-            if ($LASTEXITCODE -ne 0) { throw "A assinatura do instalador falhou (código $LASTEXITCODE)" }
-            $lista += "$arq.sig"
-          } else {
-            "Segredo FABRICA_ASSINATURA_ED25519 ausente: a Release sai sem .sig."
-          }
-          "arquivos<<FIM" >> $env:GITHUB_OUTPUT
-          $lista >> $env:GITHUB_OUTPUT
-          "FIM" >> $env:GITHUB_OUTPUT
+
+      - name: Assinar o instalador (único passo que recebe o segredo)
+        id: assinar
+        shell: bash
+        env:
+          ARQUIVO: ${{ steps.instalador.outputs.arquivo }}
+          FABRICA_ASSINATURA_ED25519: ${{ secrets.FABRICA_ASSINATURA_ED25519 }}
+        run: |
+          set -euo pipefail
+          # Versão exata (cryptography 50.0.2 é a mesma do requirements.txt do aplicativo). Sem pinagem por hash: os hashes dos wheels variam por plataforma.
+          python -m pip install --disable-pip-version-check --quiet "cryptography==50.0.2"
+          python ci/.github/scripts/assinar_ci.py assinar-instalador "$ARQUIVO" "$ARQUIVO.sig"
+
+      - name: Autoverificação (o .sig confere com a chave pública embutida no aplicativo?)
+        shell: bash
+        env:
+          ARQUIVO: ${{ steps.instalador.outputs.arquivo }}
+        run: |
+          set -euo pipefail
+          # Sem segredo aqui: só a chave pública. Falha o job se o .sig, o .sha256 ou a chave embutida no código-fonte desta versão não baterem.
+          python ci/.github/scripts/assinar_ci.py conferir-instalador "$ARQUIVO" "$ARQUIVO.sig" --sha256-arquivo "$ARQUIVO.sha256" --fonte fabrica/app/atualizacao.py
+
+      - name: Lista dos arquivos da Release
+        id: lista
+        shell: bash
+        env:
+          ARQUIVO: ${{ steps.instalador.outputs.arquivo }}
+        run: |
+          set -euo pipefail
+          for f in "$ARQUIVO" "$ARQUIVO.sha256" "$ARQUIVO.sig"; do test -s "$f" || { echo "::error::Faltando $f"; exit 1; }; done
+          {
+            echo "arquivos<<FIM"
+            echo "$ARQUIVO"
+            echo "$ARQUIVO.sha256"
+            echo "$ARQUIVO.sig"
+            echo "FIM"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Fabrica10x-Setup-${{ steps.versao.outputs.versao }}
-          path: ${{ steps.integridade.outputs.arquivos }}
+          path: ${{ steps.lista.outputs.arquivos }}
           if-no-files-found: error
           retention-days: 30
 
@@ -425,7 +477,7 @@ jobs:
           REPO_VERSOES: banca10x/fabrica-10x-versoes
           TAG: v${{ steps.versao.outputs.versao }}
           ALVO: ${{ github.event.repository.default_branch }}
-          ARQUIVOS: ${{ steps.integridade.outputs.arquivos }}
+          ARQUIVOS: ${{ steps.lista.outputs.arquivos }}
         run: |
           # O app dos usuários atualiza por este repositório (releases/latest), sem token.
           $arquivos = @($env:ARQUIVOS -split "`r?`n" | Where-Object { $_ })
