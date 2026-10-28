@@ -6,6 +6,12 @@ name: Componente de download (yt-dlp + Deno)
 #   * release download-runtime-<id>      zip + componente_download.json (uma por id)
 #   * release download-runtime-latest    só o componente_download.json (ponteiro que o app lê)
 # Ambas como pré-lançamento e fora do "latest", para não atrapalhar a atualização do programa.
+#
+# ASSINATURA (obrigatória): o app só aceita o manifesto com o arquivo componente_download.json.sig (Ed25519, chave pública embutida no
+# programa). O job usa o Environment "assinatura" (Settings > Environments), que o dono precisa criar: "Deployment branches and tags"
+# restrito à main, com o segredo FABRICA_ASSINATURA_ED25519 (64 caracteres hexadecimais) guardado DENTRO do Environment. O segredo só é
+# lido pelo passo "Assinar o manifesto". Sem ele o job falha; antes de publicar, "Autoverificação" confere o .sig contra a chave pública.
+# O .sig sobe para as DUAS releases (download-runtime-<id> e download-runtime-latest), sobre os bytes exatos do manifesto publicado.
 # O script auxiliar e a chave pública do yt-dlp vêm do repositório privado (FONTE_TOKEN, somente leitura); a impressão digital
 # da chave está fixada neste arquivo e é conferida antes de qualquer uso.
 on:
@@ -40,7 +46,27 @@ jobs:
   publicar:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: assinatura        # guarda o segredo FABRICA_ASSINATURA_ED25519 (restrito à main); ver o comentário no topo
     steps:
+      - name: Conferir os segredos FONTE_TOKEN e FABRICA_ASSINATURA_ED25519 (sem imprimir os valores)
+        shell: bash
+        env:
+          FONTE_TOKEN: ${{ secrets.FONTE_TOKEN }}
+          FABRICA_ASSINATURA_ED25519: ${{ secrets.FABRICA_ASSINATURA_ED25519 }}
+        run: |
+          if [ -z "$FONTE_TOKEN" ]; then
+            echo "::error::Falta o segredo FONTE_TOKEN (token fine-grained só em banca10x/fabrica-videos, Contents: somente leitura)."
+            exit 1
+          fi
+          if [ -z "$FABRICA_ASSINATURA_ED25519" ]; then
+            echo "::error::Falta o segredo FABRICA_ASSINATURA_ED25519. Crie o Environment 'assinatura' (restrito à main) e guarde o segredo dentro dele; sem assinatura o app recusa o componente."
+            exit 1
+          fi
+          if ! [[ "$FABRICA_ASSINATURA_ED25519" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::O segredo FABRICA_ASSINATURA_ED25519 precisa ter exatamente 64 caracteres hexadecimais (semente Ed25519)."
+            exit 1
+          fi
+
       - name: Baixar só o necessário do código-fonte privado (script auxiliar e chave pública)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -51,10 +77,20 @@ jobs:
           sparse-checkout: empacotamento/download
           path: fonte
 
+      - name: Baixar o script de assinatura deste repositório (não vem do código privado)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          path: ci
+
       - name: Escolher o yt-dlp estável (com pelo menos 24 h de idade)
         id: escolha
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           gh api "repos/yt-dlp/yt-dlp/releases?per_page=20" > releases.json
           if ! TAG=$(python3 fonte/empacotamento/download/montar_componente.py escolher releases.json --horas "$IDADE_MINIMA_HORAS"); then
@@ -71,6 +107,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.escolha.outputs.tag }}
+        shell: bash
         run: |
           mkdir -p work && cd work
           gh release download "$TAG" --repo yt-dlp/yt-dlp --pattern "yt-dlp.exe" --pattern "SHA2-256SUMS" --pattern "SHA2-256SUMS.sig"
@@ -78,6 +115,7 @@ jobs:
 
       - name: Conferir a assinatura GPG do SHA2-256SUMS e o SHA-256 do yt-dlp.exe
         if: steps.escolha.outputs.pronto == 'true'
+        shell: bash
         run: |
           export GNUPGHOME="$(mktemp -d)"
           chmod 700 "$GNUPGHOME"
@@ -99,6 +137,7 @@ jobs:
 
       - name: Baixar e conferir o Deno (versão fixada)
         if: steps.escolha.outputs.pronto == 'true'
+        shell: bash
         run: |
           cd work
           BASE="https://github.com/denoland/deno/releases/download/v${DENO_VERSAO}"
@@ -113,6 +152,7 @@ jobs:
         if: steps.escolha.outputs.pronto == 'true'
         env:
           TAG: ${{ steps.escolha.outputs.tag }}
+        shell: bash
         run: |
           ID=$(python3 fonte/empacotamento/download/montar_componente.py id "$TAG" "$DENO_VERSAO")
           echo "id=$ID" >> "$GITHUB_OUTPUT"
@@ -129,27 +169,78 @@ jobs:
           cat componente_download.json
           echo "zip=work/$ZIP" >> "$GITHUB_OUTPUT"
 
+      - name: Decidir o manifesto final (se a release do id já existe, vale o manifesto que está nela)
+        id: final
+        if: steps.escolha.outputs.pronto == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ steps.montar.outputs.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p final
+          TAG="download-runtime-$ID"
+          if gh release view "$TAG" --repo "$REPO_VERSOES" > /dev/null 2>&1; then
+            # O zip daqui não é byte a byte o que já foi publicado; o manifesto novo teria outro sha256. Fica o manifesto original (casa com o zip da release).
+            gh release download "$TAG" --repo "$REPO_VERSOES" --pattern componente_download.json --dir final --clobber
+            python3 - "$ID" <<'PY'
+          import json, sys
+          d = json.load(open("final/componente_download.json", encoding="utf-8"))
+          assert d.get("id") == sys.argv[1], "o manifesto da release existente é de outro id"
+          PY
+            echo "existe=true" >> "$GITHUB_OUTPUT"
+            echo "A release $TAG já existe: reaproveito o manifesto dela."
+          else
+            cp work/componente_download.json final/componente_download.json
+            echo "existe=false" >> "$GITHUB_OUTPUT"
+          fi
+          cat final/componente_download.json
+
+      - name: Assinar o manifesto (único passo que recebe o segredo)
+        if: steps.escolha.outputs.pronto == 'true'
+        shell: bash
+        env:
+          FABRICA_ASSINATURA_ED25519: ${{ secrets.FABRICA_ASSINATURA_ED25519 }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/assinatura-venv"
+          # Versão exata. Sem pinagem por hash: os wheels (cryptography, cffi, pycparser) variam por plataforma.
+          "$RUNNER_TEMP/assinatura-venv/bin/python" -m pip install --disable-pip-version-check --quiet "cryptography==50.0.2"
+          "$RUNNER_TEMP/assinatura-venv/bin/python" ci/.github/scripts/assinar_ci.py assinar-componente final/componente_download.json final/componente_download.json.sig
+
+      - name: Autoverificação (o .sig confere com a chave pública embutida no aplicativo?)
+        if: steps.escolha.outputs.pronto == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Sem segredo aqui. Confere os mesmos bytes que serão enviados.
+          "$RUNNER_TEMP/assinatura-venv/bin/python" ci/.github/scripts/assinar_ci.py conferir-componente final/componente_download.json final/componente_download.json.sig
+
       - name: Publicar neste repositório
         if: steps.escolha.outputs.pronto == 'true'
+        shell: bash
         env:
           # O GITHUB_TOKEN do próprio repositório público basta (permissions: contents: write). Nunca é impresso.
           GH_TOKEN: ${{ github.token }}
           ID: ${{ steps.montar.outputs.id }}
           ZIP: ${{ steps.montar.outputs.zip }}
+          EXISTE: ${{ steps.final.outputs.existe }}
         run: |
+          set -euo pipefail
           TAG="download-runtime-$ID"
           NOTAS="Componente de download do app (yt-dlp e Deno). Baixado pelo app sozinho; não é uma versão do programa."
-          MANIFESTO=work/componente_download.json
-          if ! gh release view "$TAG" --repo "$REPO_VERSOES" > /dev/null 2>&1; then
-            gh release create "$TAG" "$ZIP" "$MANIFESTO" --repo "$REPO_VERSOES" --title "$TAG" --notes "$NOTAS" --prerelease --latest=false
+          MANIFESTO=final/componente_download.json
+          if [ "$EXISTE" != "true" ]; then
+            gh release create "$TAG" "$ZIP" "$MANIFESTO" "$MANIFESTO.sig" --repo "$REPO_VERSOES" --title "$TAG" --notes "$NOTAS" --prerelease --latest=false
           else
-            echo "A release $TAG já existe; só confiro o ponteiro."
+            echo "A release $TAG já existe; garanto o manifesto e o .sig nela e confiro o ponteiro."
+            gh release upload "$TAG" "$MANIFESTO" "$MANIFESTO.sig" --clobber --repo "$REPO_VERSOES"
           fi
           PONTEIRO="download-runtime-latest"
           if gh release view "$PONTEIRO" --repo "$REPO_VERSOES" > /dev/null 2>&1; then
-            gh release upload "$PONTEIRO" "$MANIFESTO" --clobber --repo "$REPO_VERSOES"
+            gh release upload "$PONTEIRO" "$MANIFESTO" "$MANIFESTO.sig" --clobber --repo "$REPO_VERSOES"
             gh release edit "$PONTEIRO" --notes "Ponteiro do componente de download: aponta para $ID." --prerelease --latest=false --repo "$REPO_VERSOES"
           else
-            gh release create "$PONTEIRO" "$MANIFESTO" --repo "$REPO_VERSOES" --title "$PONTEIRO" --notes "Ponteiro do componente de download: aponta para $ID." --prerelease --latest=false
+            gh release create "$PONTEIRO" "$MANIFESTO" "$MANIFESTO.sig" --repo "$REPO_VERSOES" --title "$PONTEIRO" --notes "Ponteiro do componente de download: aponta para $ID." --prerelease --latest=false
           fi
           echo "Publicado: https://github.com/$REPO_VERSOES/releases/tag/$TAG"
